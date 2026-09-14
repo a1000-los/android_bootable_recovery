@@ -31,35 +31,56 @@
 MinuiBackendFbdev::MinuiBackendFbdev() : gr_draw(nullptr), fb_fd(-1) {}
 
 void MinuiBackendFbdev::Blank(bool blank) {
-#if defined(TW_NO_SCREEN_BLANK) && defined(TW_BRIGHTNESS_PATH) && defined(TW_MAX_BRIGHTNESS)
-    int fd;
-    char brightness[4];
-    snprintf(brightness, 4, "%03d", TW_MAX_BRIGHTNESS/2);
-
-    fd = open(TW_BRIGHTNESS_PATH, O_RDWR);
-    if (fd < 0) {
-        perror("cannot open LCD backlight");
-        return;
-    }
-    write(fd, blank ? "000" : brightness, 3);
-    close(fd);
-#else
-    int ret;
-
-    ret = ioctl(fb_fd, FBIOBLANK, blank ? FB_BLANK_POWERDOWN : FB_BLANK_UNBLANK);
-    if (ret < 0)
-        perror("ioctl(): blank");
-#endif
+  int ret = ioctl(fb_fd, FBIOBLANK, blank ? FB_BLANK_POWERDOWN : FB_BLANK_UNBLANK);
+  if (ret < 0) perror("ioctl(): blank");
 }
 
 void MinuiBackendFbdev::SetDisplayedFramebuffer(unsigned n) {
   if (n > 1 || !double_buffered) return;
 
-  vi.yres_virtual = gr_framebuffer[0].height * 2;
+  // A1000/sprdfb: у драйвера ТРИ буфера (yres_virtual = yres*3), а
+  // sprdfb_check_var отвергает любое другое значение, поэтому жёстко
+  // прописанный здесь height*2 делал FBIOPUT_VSCREENINFO -EINVAL, а следом и
+  // pan уходил в никуда: yoffset не менялся, экран всё время показывал буфер
+  // 0, тогда как minui рисовал попеременно в 0 и 1. Каждый второй кадр
+  // healthd очищал прямо видимый буфер — это и было мерцание.
+  // Уважаем yres_virtual драйвера, если его хватает на два буфера.
+  if (vi.yres_virtual < static_cast<__u32>(gr_framebuffer[0].height * 2)) {
+    vi.yres_virtual = gr_framebuffer[0].height * 2;
+  }
   vi.yoffset = n * gr_framebuffer[0].height;
   vi.bits_per_pixel = gr_framebuffer[0].pixel_bytes * 8;
   if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vi) < 0) {
     perror("active fb swap failed");
+  }
+#ifdef BOARD_RECOVERY_NEEDS_FBIOPAN_DISPLAY
+  if (ioctl(fb_fd, FBIOPAN_DISPLAY, &vi) < 0) {
+    perror("pan failed");
+  }
+#endif
+
+  // И проверяем, что переключение действительно состоялось. Если драйвер
+  // yoffset не принял, двойная буферизация — обман: дальше рисуем в память и
+  // копируем готовый кадр целиком, мерцать нечему.
+  fb_var_screeninfo check;
+  if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &check) == 0 && check.yoffset != vi.yoffset) {
+    printf("fbdev: yoffset %u not applied (got %u), switching to single buffer\n",
+           vi.yoffset, check.yoffset);
+    GRSurface* mem = static_cast<GRSurface*>(malloc(sizeof(GRSurface)));
+    if (mem != nullptr) {
+      memcpy(mem, gr_framebuffer, sizeof(GRSurface));
+      mem->data = static_cast<unsigned char*>(malloc(mem->height * mem->row_bytes));
+      if (mem->data != nullptr) {
+        memset(mem->data, 0, mem->height * mem->row_bytes);
+        double_buffered = false;
+        gr_draw = mem;
+        vi.yoffset = 0;
+        ioctl(fb_fd, FBIOPAN_DISPLAY, &vi);
+        displayed_buffer = 0;
+        return;
+      }
+      free(mem);
+    }
   }
   displayed_buffer = n;
 }
